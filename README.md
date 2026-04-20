@@ -20,13 +20,7 @@ Make sure you have [Node.js](https://nodejs.org/) installed on your machine.
    npm install
    ```
 
-3. **Set backend URL (env)**
-   Create/update `.env` in project root:
-   ```bash
-   VITE_API_BASE=http://localhost:8000
-   ```
-
-4. **Start the development server**
+3. **Start the development server**
    You can start the frontend development server using:
    ```bash
    npm run dev
@@ -36,7 +30,7 @@ Make sure you have [Node.js](https://nodejs.org/) installed on your machine.
    npm run dev -- --host 0.0.0.0
    ```
 
-5. **Access the application**
+4. **Access the application**
    Once the server starts, open your browser and navigate to:
    [http://localhost:5173/](http://localhost:5173/) or the port specified in your terminal output (e.g., `5174`).
 
