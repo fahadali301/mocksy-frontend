@@ -1,24 +1,25 @@
 import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
 import ChatBubble from './ChatBubble';
 import * as faceapi from '@vladmandic/face-api';
 
 export default function VideoInterview({ cv_id, role, token }) {
   const navigate = useNavigate();
+  const { API_BASE } = useAuth();
   const videoRef = useRef(null);
-  const socketRef = useRef(null);
 
   // States
   const [isConnected, setIsConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
-  const [streamingText, setStreamingText] = useState('');
   const [interimTranscript, setInterimTranscript] = useState('');
   const [isListening, setIsListening] = useState(false);
   const [isAiSpeaking, setIsAiSpeaking] = useState(false);
-  const [subtitle, setSubtitle] = useState('Initializing AI connection...');
+  const [subtitle, setSubtitle] = useState('Starting interview...');
   const [evalResult, setEvalResult] = useState(null);
   const [modelsLoaded, setModelsLoaded] = useState(false);
   const [detectedEmotion, setDetectedEmotion] = useState(null);
+  const [interviewId, setInterviewId] = useState(null);
 
   // Web Speech API refs
   const recognitionRef = useRef(null);
@@ -103,7 +104,11 @@ export default function VideoInterview({ cv_id, role, token }) {
 
       recognition.onend = () => {
         if (isListening) {
-          try { recognition.start(); } catch (e) { }
+          try {
+            recognition.start();
+          } catch {
+            // Ignore restart races when recognition is already running.
+          }
         }
       };
 
@@ -134,76 +139,59 @@ export default function VideoInterview({ cv_id, role, token }) {
     };
   }, []);
 
-  // Handle WebSocket connection
+  // Start interview over REST (Vercel-compatible)
   useEffect(() => {
     if (!token || !cv_id) {
       navigate('/dashboard');
       return;
     }
 
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.hostname}:8000/ws/interview?token=${token}`;
-    const ws = new WebSocket(wsUrl);
-    socketRef.current = ws;
+    let cancelled = false;
 
-    ws.onopen = () => {
-      setIsConnected(true);
-      ws.send(JSON.stringify({
-        type: 'start',
-        cv_id: parseInt(cv_id),
-        role: role || ''
-      }));
-    };
+    const startInterview = async () => {
+      setIsTyping(true);
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      try {
+        const res = await fetch(`${API_BASE}/interview/start`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            cv_id: Number.parseInt(cv_id, 10),
+            role: role || null,
+          }),
+        });
 
-      switch (data.type) {
-        case 'question_started':
-          setIsTyping(true);
-          setStreamingText('');
-          setSubtitle('AI is thinking...');
-          break;
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || 'Failed to start interview');
+        }
 
-        case 'token':
-          setStreamingText(prev => prev + data.text);
-          setSubtitle(prev => prev === 'AI is thinking...' ? data.text : prev + data.text);
-          break;
-
-        case 'question_complete':
-          setIsTyping(false);
-          setSubtitle(data.text);
-          speakText(data.text);
-          break;
-
-        case 'evaluating':
-          setSubtitle('Interview complete. AI is evaluating your performance...');
-          break;
-
-        case 'result':
-          setEvalResult(data.data);
-          setSubtitle('Evaluation complete.');
-          break;
-
-        case 'error':
-          setSubtitle(`Error: ${data.detail}`);
-          setIsTyping(false);
-          break;
-
-        default:
-          break;
+        if (cancelled) return;
+        setInterviewId(data.interview_id);
+        setIsConnected(true);
+        setSubtitle(data.next_question);
+        speakText(data.next_question);
+      } catch (err) {
+        if (cancelled) return;
+        setSubtitle(`Error: ${err.message}`);
+        setIsConnected(false);
+      } finally {
+        if (!cancelled) setIsTyping(false);
       }
     };
 
-    ws.onclose = () => setIsConnected(false);
+    startInterview();
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) ws.close();
       if (synthRef) synthRef.cancel();
       if (recognitionRef.current) recognitionRef.current.stop();
       if (detectionIntervalRef.current) clearInterval(detectionIntervalRef.current);
+      cancelled = true;
     };
-  }, [token, cv_id, role, navigate]);
+  }, [token, cv_id, role, navigate, API_BASE]);
 
   // TTS function
   const speakText = (text) => {
@@ -228,12 +216,46 @@ export default function VideoInterview({ cv_id, role, token }) {
     synthRef.speak(utterance);
   };
 
-  const handleSendAnswer = (text) => {
-    if (!text || !isConnected || isTyping) return;
-    socketRef.current.send(JSON.stringify({ type: 'answer', text }));
+  const handleSendAnswer = async (text) => {
+    if (!text || !isConnected || isTyping || !interviewId) return;
+
     setSubtitle(`You: ${text}`);
     setIsListening(false);
     if (recognitionRef.current) recognitionRef.current.stop();
+
+    setIsTyping(true);
+
+    try {
+      const res = await fetch(`${API_BASE}/interview/turn`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          interview_id: interviewId,
+          answer: text,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to submit answer');
+      }
+
+      if (data.status === 'completed') {
+        setEvalResult(data.result);
+        setSubtitle('Evaluation complete.');
+        setIsConnected(false);
+      } else {
+        setSubtitle(data.next_question);
+        speakText(data.next_question);
+      }
+    } catch (err) {
+      setSubtitle(`Error: ${err.message}`);
+    } finally {
+      setIsTyping(false);
+    }
   };
 
   const toggleMic = () => {
@@ -246,17 +268,49 @@ export default function VideoInterview({ cv_id, role, token }) {
       synthRef?.cancel();
       setIsListening(true);
       setInterimTranscript('');
-      try { recognitionRef.current?.start(); } catch (e) { }
+      try {
+        recognitionRef.current?.start();
+      } catch {
+        // Ignore startup races when recognition is already active.
+      }
     }
   };
 
-  const handleExit = () => {
-    if (socketRef.current && isConnected) {
-      socketRef.current.send(JSON.stringify({ type: 'exit' }));
-      setIsListening(false);
-      recognitionRef.current?.stop();
-      synthRef?.cancel();
-      
+  const handleExit = async () => {
+    if (!isConnected || isTyping || !interviewId) return;
+
+    setIsListening(false);
+    recognitionRef.current?.stop();
+    synthRef?.cancel();
+    setIsTyping(true);
+    setSubtitle('Interview complete. AI is evaluating your performance...');
+
+    try {
+      const res = await fetch(`${API_BASE}/interview/turn`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          interview_id: interviewId,
+          answer: 'exit',
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to end interview');
+      }
+
+      setEvalResult(data.result);
+      setSubtitle('Evaluation complete.');
+      setIsConnected(false);
+    } catch (err) {
+      setSubtitle(`Error: ${err.message}`);
+    } finally {
+      setIsTyping(false);
+
       // Turn off camera explicitly
       if (videoRef.current && videoRef.current.srcObject) {
         videoRef.current.srcObject.getTracks().forEach(track => track.stop());
@@ -283,7 +337,7 @@ export default function VideoInterview({ cv_id, role, token }) {
           <h2>Face-to-Face Mock Interview</h2>
           <p>
             <span className={`connection-dot ${isConnected ? 'connected' : 'disconnected'}`} />
-            {isConnected ? 'Connected' : 'Disconnected'}
+            {isConnected ? 'Connected' : (isTyping && !interviewId ? 'Starting...' : 'Disconnected')}
             {role && ` • Target: ${role}`}
           </p>
         </div>

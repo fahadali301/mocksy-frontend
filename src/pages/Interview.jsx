@@ -5,7 +5,7 @@ import ChatBubble from '../components/ChatBubble';
 import VideoInterview from '../components/VideoInterview';
 
 export default function Interview() {
-  const { token } = useAuth();
+  const { token, API_BASE } = useAuth();
   const [searchParams] = useSearchParams();
   const navigate = useNavigate();
   const cv_id = searchParams.get('cv_id');
@@ -16,23 +16,18 @@ export default function Interview() {
   const [input, setInput] = useState('');
   const [isConnected, setIsConnected] = useState(false);
   const [isTyping, setIsTyping] = useState(false);
-  const [streamingText, setStreamingText] = useState('');
   const [provider, setProvider] = useState('');
-  
-  const socketRef = useRef(null);
+  const [interviewId, setInterviewId] = useState(null);
+
   const messagesEndRef = useRef(null);
 
   if (mode === 'video') {
     return <VideoInterview cv_id={cv_id} role={role} token={token} />;
   }
 
-  const scrollToBottom = () => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  };
-
   useEffect(() => {
-    scrollToBottom();
-  }, [messages, streamingText, isTyping]);
+    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+  }, [messages, isTyping]);
 
   useEffect(() => {
     if (!token || !cv_id) {
@@ -40,89 +35,123 @@ export default function Interview() {
       return;
     }
 
-    // Connect to WebSocket
-    const protocol = window.location.protocol === 'https:' ? 'wss:' : 'ws:';
-    const wsUrl = `${protocol}//${window.location.hostname}:8000/ws/interview?token=${token}`;
-    const ws = new WebSocket(wsUrl);
-    socketRef.current = ws;
+    let cancelled = false;
 
-    ws.onopen = () => {
-      setIsConnected(true);
-      // Start the interview session automatically
-      ws.send(JSON.stringify({
-        type: 'start',
-        cv_id: parseInt(cv_id),
-        role: role
-      }));
-    };
+    const startInterview = async () => {
+      setIsTyping(true);
+      setIsConnected(false);
 
-    ws.onmessage = (event) => {
-      const data = JSON.parse(event.data);
+      try {
+        const res = await fetch(`${API_BASE}/interview/start`, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'Authorization': `Bearer ${token}`,
+          },
+          body: JSON.stringify({
+            cv_id: Number.parseInt(cv_id, 10),
+            role: role || null,
+          }),
+        });
 
-      switch (data.type) {
-        case 'question_started':
-          setIsTyping(true);
-          setStreamingText('');
-          break;
+        const data = await res.json();
+        if (!res.ok) {
+          throw new Error(data.detail || 'Failed to start interview');
+        }
 
-        case 'token':
-          setStreamingText(prev => prev + data.text);
-          break;
-
-        case 'question_complete':
-          setIsTyping(false);
-          setMessages(prev => [...prev, { role: 'ai', text: data.text }]);
-          setStreamingText('');
-          if (data.powered_by) setProvider(data.powered_by);
-          break;
-
-        case 'evaluating':
-          setMessages(prev => [...prev, { role: 'status', text: 'AI is evaluating your performance...' }]);
-          break;
-
-        case 'result':
-          setMessages(prev => [...prev, { role: 'result', result: data.data }]);
-          if (data.powered_by) setProvider(data.powered_by);
-          break;
-
-        case 'error':
-          setMessages(prev => [...prev, { role: 'ai', text: `Error: ${data.detail}` }]);
-          setIsTyping(false);
-          break;
-
-        default:
-          console.log('Unknown message type:', data.type);
+        if (cancelled) return;
+        setInterviewId(data.interview_id);
+        setIsConnected(true);
+        setMessages([{ role: 'ai', text: data.next_question }]);
+        if (data.powered_by) setProvider(data.powered_by);
+      } catch (err) {
+        if (cancelled) return;
+        setMessages([{ role: 'ai', text: `Error: ${err.message}` }]);
+      } finally {
+        if (!cancelled) setIsTyping(false);
       }
     };
 
-    ws.onclose = () => {
-      setIsConnected(false);
-    };
+    startInterview();
 
     return () => {
-      if (ws.readyState === WebSocket.OPEN) {
-        ws.close();
-      }
+      cancelled = true;
     };
-  }, [token, cv_id, role, navigate]);
+  }, [token, cv_id, role, navigate, API_BASE]);
 
-  const handleSend = (e) => {
+  const handleSend = async (e) => {
     if (e) e.preventDefault();
-    if (!input.trim() || !isConnected || isTyping) return;
+    if (!input.trim() || !isConnected || isTyping || !interviewId) return;
 
     const userMsg = input.trim();
-    setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
     setInput('');
+    setMessages(prev => [...prev, { role: 'user', text: userMsg }]);
+    setIsTyping(true);
 
-    socketRef.current.send(JSON.stringify({
-      type: 'answer',
-      text: userMsg
-    }));
+    try {
+      const res = await fetch(`${API_BASE}/interview/turn`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          interview_id: interviewId,
+          answer: userMsg,
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to submit answer');
+      }
+
+      if (data.powered_by) setProvider(data.powered_by);
+
+      if (data.status === 'completed') {
+        setIsConnected(false);
+        setMessages(prev => [...prev, { role: 'result', result: data.result }]);
+      } else {
+        setMessages(prev => [...prev, { role: 'ai', text: data.next_question }]);
+      }
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }]);
+    } finally {
+      setIsTyping(false);
+    }
   };
 
-  const handleExit = () => {
-    if (socketRef.current && isConnected) {
-      socketRef.current.send(JSON.stringify({ type: 'exit' }));
+  const handleExit = async () => {
+    if (!isConnected || isTyping || !interviewId) return;
+
+    setMessages(prev => [...prev, { role: 'status', text: 'AI is evaluating your performance...' }]);
+    setIsTyping(true);
+
+    try {
+      const res = await fetch(`${API_BASE}/interview/turn`, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({
+          interview_id: interviewId,
+          answer: 'exit',
+        }),
+      });
+
+      const data = await res.json();
+      if (!res.ok) {
+        throw new Error(data.detail || 'Failed to end interview');
+      }
+
+      if (data.powered_by) setProvider(data.powered_by);
+      setIsConnected(false);
+      setMessages(prev => [...prev, { role: 'result', result: data.result }]);
+    } catch (err) {
+      setMessages(prev => [...prev, { role: 'ai', text: `Error: ${err.message}` }]);
+    } finally {
+      setIsTyping(false);
     }
   };
 
@@ -140,7 +169,7 @@ export default function Interview() {
           <h2>Live Interview Session</h2>
           <p>
             <span className={`connection-dot ${isConnected ? 'connected' : 'disconnected'}`} />
-            {isConnected ? 'Connected' : 'Disconnected'} 
+            {isConnected ? 'Connected' : (isTyping && !interviewId ? 'Starting...' : 'Disconnected')}
             {role && ` • Target: ${role}`}
           </p>
         </div>
@@ -158,15 +187,13 @@ export default function Interview() {
             Starting your AI interview session...
           </div>
         )}
-        
+
         {messages.map((m, i) => (
           <ChatBubble key={i} role={m.role} text={m.text} result={m.result} />
         ))}
 
-        {isTyping && (
-          <ChatBubble role="ai" text={streamingText} streaming={true} />
-        )}
-        
+        {isTyping && <ChatBubble role="status" text="AI is thinking..." />}
+
         <div ref={messagesEndRef} />
       </div>
 
@@ -178,9 +205,9 @@ export default function Interview() {
           onKeyDown={onKeyDown}
           disabled={!isConnected || isTyping}
         />
-        <button 
-          onClick={handleSend} 
-          className="btn btn-primary" 
+        <button
+          onClick={handleSend}
+          className="btn btn-primary"
           disabled={!input.trim() || !isConnected || isTyping}
           style={{ height: '48px', minWidth: '80px' }}
         >
